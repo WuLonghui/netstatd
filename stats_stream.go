@@ -1,58 +1,63 @@
 package netstatd
 
 import (
-	"time"
+	"bufio"
+	"io"
+	"log"
+	"net/http"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/tcpassembly"
+	"github.com/google/gopacket/tcpassembly/tcpreader"
 )
 
 // statsStreamFactory implements tcpassembly.StreamFactory
 type statsStreamFactory struct {
-	*NetStats
+	netStat *NetStat
 }
 
 // statsStream will handle the actual decoding of stats requests.
 type statsStream struct {
-	net, transport                      gopacket.Flow
-	bytes, packets, outOfOrder, skipped int64
-	start, end                          time.Time
-	sawStart, sawEnd                    bool
-	streams                             int64
-	*NetStats
+	net, transport gopacket.Flow
+	netStat        *NetStat
+	r              tcpreader.ReaderStream
 }
 
 func (factory *statsStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream {
 	s := &statsStream{
 		net:       net,
 		transport: transport,
-		start:     time.Now(),
-		NetStats:  factory.NetStats,
+		netStat:   factory.netStat,
+		r:         tcpreader.NewReaderStream(),
 	}
-	s.end = s.start
-	// ReaderStream implements tcpassembly.Stream, so we can return a pointer to it.
+
+	go s.parseHttpRequest()
 	return s
 }
 
 func (s *statsStream) Reassembled(reassemblies []tcpassembly.Reassembly) {
 	for _, reassembly := range reassemblies {
-		if reassembly.Seen.Before(s.end) {
-			s.outOfOrder++
-		} else {
-			s.end = reassembly.Seen
-		}
-		s.bytes += int64(len(reassembly.Bytes))
-		s.packets += 1
-		if reassembly.Skip > 0 {
-			s.skipped += int64(reassembly.Skip)
-		}
-		s.sawStart = s.sawStart || reassembly.Start
-		s.sawEnd = s.sawEnd || reassembly.End
-
-		s.Mark(reassembly.Bytes)
+		s.netStat.MarkTcp(reassembly.Bytes)
 	}
+
+	s.r.Reassembled(reassemblies)
 }
 
 func (s *statsStream) ReassemblyComplete() {
-	//do nothing
+	s.r.ReassemblyComplete()
+}
+
+func (s *statsStream) parseHttpRequest() {
+	buf := bufio.NewReader(&s.r)
+	for {
+		req, err := http.ReadRequest(buf)
+		if err == io.EOF {
+			// We must read until we see an EOF... very important!
+			return
+		} else if err != nil {
+			log.Println("Error reading stream", s.net, s.transport, ":", err)
+		} else {
+			s.netStat.MarkHttpRequest(req)
+		}
+	}
 }
