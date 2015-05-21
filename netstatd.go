@@ -4,15 +4,10 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/coreos/go-namespaces/namespace"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/tcpassembly"
-)
-
-const (
-	CURRENT_NS_PID = 0
 )
 
 type Netstatd struct {
@@ -20,7 +15,7 @@ type Netstatd struct {
 }
 
 type NetstatdInNS struct {
-	Pid       int
+	N         *Namespace
 	Direction string
 	NetStats  map[string]*NetStat
 }
@@ -28,7 +23,7 @@ type NetstatdInNS struct {
 func NewNetstatd() *Netstatd {
 	ns := make(map[int]*NetstatdInNS)
 	ns[CURRENT_NS_PID] = &NetstatdInNS{
-		Pid:      CURRENT_NS_PID,
+		N:        NewNamespace(CURRENT_NS_PID),
 		NetStats: make(map[string]*NetStat),
 	}
 
@@ -42,23 +37,23 @@ func (d Netstatd) Run() error {
 }
 
 func (d Netstatd) AddNameSpaceStat(pid int) error {
-	if !NameSpaceExist(pid) {
+	n := NewNamespace(pid)
+	if !n.Exist() {
 		return fmt.Errorf("namespace not found")
 	}
 
 	d.NS[pid] = &NetstatdInNS{
-		Pid:      pid,
+		N:        n,
 		NetStats: make(map[string]*NetStat),
 	}
 
 	return d.NS[pid].stat()
-
 }
 
 func (d NetstatdInNS) stat() error {
-	log.Printf("starting stat in namespace(pid: %d)", d.Pid)
+	log.Printf("starting stat in namespace(%v)", d.N)
 
-	err := SetNameSpace(d.Pid)
+	err := d.N.Set()
 	if err != nil {
 		log.Printf("error setting namespace, %v", err)
 		return err
@@ -156,36 +151,4 @@ func (d NetstatdInNS) capture(iface pcap.Interface) error {
 	}()
 
 	return nil
-}
-
-func SetNameSpace(pid int) error {
-	if pid == CURRENT_NS_PID {
-		return nil
-	}
-
-	fd, err := namespace.OpenProcess(pid, namespace.CLONE_NEWNET)
-	defer namespace.Close(fd)
-
-	if err != nil {
-		return err
-	}
-
-	// Join the container namespace
-	errno := namespace.Setns(fd, namespace.CLONE_NEWNET)
-	if errno != 0 {
-		return fmt.Errorf("error setting namespace")
-	}
-
-	return nil
-}
-
-func NameSpaceExist(pid int) bool {
-	fd, err := namespace.OpenProcess(pid, namespace.CLONE_NEWNET)
-	defer namespace.Close(fd)
-
-	if err != nil {
-		return false
-	}
-
-	return true
 }
