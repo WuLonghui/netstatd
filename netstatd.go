@@ -3,55 +3,116 @@ package netstatd
 import (
 	"fmt"
 	"log"
+	"strings"
+	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/tcpassembly"
+
+	. "netstatd/namespace"
+	. "netstatd/namespace/discovery"
 )
 
 type Netstatd struct {
 	NS map[int]*NetstatdInNS
 }
 
-type NetstatdInNS struct {
-	N         *Namespace
-	Direction string
-	NetStats  map[string]*NetStat
-}
-
 func NewNetstatd() *Netstatd {
 	ns := make(map[int]*NetstatdInNS)
-	ns[CURRENT_NS_PID] = &NetstatdInNS{
-		N:        NewNamespace(CURRENT_NS_PID),
-		NetStats: make(map[string]*NetStat),
-	}
-
 	return &Netstatd{
 		NS: ns,
 	}
 }
 
-func (d Netstatd) Run() error {
-	return d.NS[CURRENT_NS_PID].stat()
+func (d Netstatd) Run(statTarget string) error {
+	if strings.Contains(statTarget, "host") {
+		namespace := NewNamespace(CURRENT_NAMESPACE_PID, "host")
+		err := d.AddNameSpace(namespace)
+		if err != nil {
+			return err
+		}
+	}
+
+	if strings.Contains(statTarget, "docker") {
+		dockerDiscovery := NewDockerDiscovery()
+		go func() {
+			ticker := time.NewTicker(time.Second * 1)
+			defer ticker.Stop()
+			for {
+				<-ticker.C
+				namespaces := dockerDiscovery.ListAllNamespaces()
+				for _, namespace := range namespaces {
+					err := d.AddNameSpace(namespace)
+					if err != nil {
+						log.Printf("error adding namespace, %v", err)
+					}
+				}
+			}
+		}()
+	}
+
+	return nil
 }
 
-func (d Netstatd) AddNameSpaceStat(pid int) error {
-	n := NewNamespace(pid)
+func (d Netstatd) Stop() {
+	for _, n := range d.NS {
+		n.Stop()
+	}
+}
+
+func (d Netstatd) AddNameSpace(n *Namespace) error {
 	if !n.Exist() {
 		return fmt.Errorf("namespace not found")
 	}
 
-	d.NS[pid] = &NetstatdInNS{
-		N:        n,
-		NetStats: make(map[string]*NetStat),
+	if _, ok := d.NS[n.Pid]; ok {
+		return nil
 	}
 
-	return d.NS[pid].stat()
+	d.NS[n.Pid] = &NetstatdInNS{
+		N:        n,
+		NetStats: make(map[string]*NetStat),
+		running:  false,
+	}
+
+	return d.NS[n.Pid].Run()
 }
 
-func (d NetstatdInNS) stat() error {
-	log.Printf("starting stat in namespace(%v)", d.N)
+func (d Netstatd) GetNetStats(namespace *Namespace) map[string]*NetStat {
+	n, ok := d.NS[namespace.Pid]
+	if !ok {
+		return make(map[string]*NetStat)
+	}
+	return n.NetStats
+}
+
+func (d Netstatd) GetAllNetStats() []*NetStat {
+	netStats := make([]*NetStat, 0)
+	for _, n := range d.NS {
+		for _, netStat := range n.NetStats {
+			netStats = append(netStats, netStat)
+		}
+	}
+
+	return netStats
+}
+
+type NetstatdInNS struct {
+	N         *Namespace
+	Direction string
+	NetStats  map[string]*NetStat
+
+	running bool
+}
+
+func (d NetstatdInNS) Run() error {
+	if d.running {
+		return nil
+	}
+
+	log.Printf("starting run in namespace(%v)", d.N)
 
 	err := d.N.Set()
 	if err != nil {
@@ -59,7 +120,7 @@ func (d NetstatdInNS) stat() error {
 		return err
 	}
 
-	ifs, err := d.findDevs("nflog", "nfqueue", "any", "lo")
+	ifs, err := d.FindDevs("nflog", "nfqueue", "any", "lo")
 	if err != nil {
 		log.Printf("error finding devs, %v", err)
 		return err
@@ -73,10 +134,15 @@ func (d NetstatdInNS) stat() error {
 		}
 	}
 
+	d.running = true
 	return nil
 }
 
-func (d NetstatdInNS) findDevs(exceptions ...string) ([]pcap.Interface, error) {
+func (d NetstatdInNS) Stop() {
+
+}
+
+func (d NetstatdInNS) FindDevs(exceptions ...string) ([]pcap.Interface, error) {
 	ifs := make([]pcap.Interface, 0)
 	devs, err := pcap.FindAllDevs()
 	if err != nil {
@@ -122,7 +188,7 @@ func (d NetstatdInNS) capture(iface pcap.Interface) error {
 	}
 
 	// Set up assembly
-	neStat := NewNetStat(iface)
+	neStat := NewNetStat(d.N, iface)
 	d.NetStats[iface.Name] = neStat
 	streamFactory := &statsStreamFactory{
 		netStat: neStat,

@@ -1,77 +1,48 @@
 package controllers
 
 import (
-	"encoding/json"
 	"fmt"
 
 	"github.com/astaxie/beego"
+	. "netstatd/namespace"
+	. "netstatd/namespace/discovery"
 )
 
 type NetStatsController struct {
 	beego.Controller
 }
 
+func (c *NetStatsController) ShowAll() {
+	SetSuccessOutput(c.Ctx, 200, D.GetAllNetStats())
+}
+
 func (c *NetStatsController) Show() {
-	pid, err := c.GetInt("pid")
-	if err != nil {
-		SetErrorOutput(c.Ctx, 400, fmt.Errorf("Invaild parameters"))
-		return
+	var (
+		namespace *Namespace
+		err       error
+	)
+
+	dockerContainerId := c.GetString("docker_container_id")
+	if dockerContainerId != "" {
+		dockerDiscovery := NewDockerDiscovery()
+		namespace, err = dockerDiscovery.GetNamespace(dockerContainerId)
+		if err != nil {
+			SetErrorOutput(c.Ctx, 500, err)
+			return
+		}
 	}
 
-	d, ok := D.NS[pid]
-	if !ok {
-		SetErrorOutput(c.Ctx, 404, fmt.Errorf("Namespace not in stat"))
-		return
+	if namespace == nil {
+		namespace = NewNamespace(CURRENT_NAMESPACE_PID, "host")
 	}
+
+	netStats := D.GetNetStats(namespace)
 
 	iface := c.Ctx.Input.Param(":interface")
-	netStat, ok := d.NetStats[iface]
+	netStat, ok := netStats[iface]
 	if !ok {
 		SetErrorOutput(c.Ctx, 404, fmt.Errorf("Interface not found"))
 		return
 	}
 	SetSuccessOutput(c.Ctx, 200, netStat)
-}
-
-func (c *NetStatsController) ShowAll() {
-	pid, err := c.GetInt("pid")
-	if err != nil {
-		SetErrorOutput(c.Ctx, 400, fmt.Errorf("Invaild parameters"))
-		return
-	}
-
-	d, ok := D.NS[pid]
-	if !ok {
-		SetErrorOutput(c.Ctx, 404, fmt.Errorf("Namespace not in stat"))
-		return
-	}
-
-	SetSuccessOutput(c.Ctx, 200, d.NetStats)
-}
-
-func (c *NetStatsController) Create() {
-	type CreateRequest struct {
-		Pid int `json:"pid"`
-	}
-
-	var createRequest CreateRequest
-	err := json.Unmarshal(c.Ctx.Input.RequestBody, &createRequest)
-	if err != nil {
-		SetErrorOutput(c.Ctx, 400, err)
-		return
-	}
-
-	_, ok := D.NS[createRequest.Pid]
-	if ok {
-		SetErrorOutput(c.Ctx, 400, fmt.Errorf("Namespace already in stat"))
-		return
-	}
-
-	err = D.AddNameSpaceStat(createRequest.Pid)
-	if err != nil {
-		SetErrorOutput(c.Ctx, 400, err)
-		return
-	}
-
-	SetSuccessOutput(c.Ctx, 201, nil)
 }
