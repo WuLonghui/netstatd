@@ -16,7 +16,8 @@ import (
 )
 
 type Netstatd struct {
-	NS map[int]*NetstatdInNS
+	NS                 map[int]*NetstatdInNS
+	namespaceDiscovery chan bool
 }
 
 func NewNetstatd() *Netstatd {
@@ -36,21 +37,27 @@ func (d Netstatd) Run(statTarget string) error {
 	}
 
 	if strings.Contains(statTarget, "docker") {
+		stop := make(chan bool)
 		dockerDiscovery := NewDockerDiscovery()
 		go func() {
 			ticker := time.NewTicker(time.Second * 1)
 			defer ticker.Stop()
 			for {
-				<-ticker.C
-				namespaces := dockerDiscovery.ListAllNamespaces()
-				for _, namespace := range namespaces {
-					err := d.AddNameSpace(namespace)
-					if err != nil {
-						log.Printf("error adding namespace, %v", err)
+				select {
+				case <-ticker.C:
+					namespaces := dockerDiscovery.ListAllNamespaces()
+					for _, namespace := range namespaces {
+						err := d.AddNameSpace(namespace)
+						if err != nil {
+							log.Printf("error adding namespace, %v", err)
+						}
 					}
+				case <-stop:
+					return
 				}
 			}
 		}()
+		d.namespaceDiscovery = stop
 	}
 
 	return nil
@@ -60,24 +67,23 @@ func (d Netstatd) Stop() {
 	for _, n := range d.NS {
 		n.Stop()
 	}
+	if d.namespaceDiscovery != nil {
+		close(d.namespaceDiscovery)
+	}
 }
 
-func (d Netstatd) AddNameSpace(n *Namespace) error {
-	if !n.Exist() {
+func (d *Netstatd) AddNameSpace(namespace *Namespace) error {
+	if !namespace.Exist() {
 		return fmt.Errorf("namespace not found")
 	}
 
-	if _, ok := d.NS[n.Pid]; ok {
+	if _, ok := d.NS[namespace.Pid]; ok {
 		return nil
 	}
 
-	d.NS[n.Pid] = &NetstatdInNS{
-		N:        n,
-		NetStats: make(map[string]*NetStat),
-		running:  false,
-	}
+	d.NS[namespace.Pid] = NewNetstatdInNS(namespace)
 
-	return d.NS[n.Pid].Run()
+	return d.NS[namespace.Pid].Run()
 }
 
 func (d Netstatd) GetNetStats(namespace *Namespace) map[string]*NetStat {
@@ -104,11 +110,21 @@ type NetstatdInNS struct {
 	Direction string
 	NetStats  map[string]*NetStat
 
-	running bool
+	Running         bool
+	runningCaptures []chan bool
 }
 
-func (d NetstatdInNS) Run() error {
-	if d.running {
+func NewNetstatdInNS(namespace *Namespace) *NetstatdInNS {
+	return &NetstatdInNS{
+		N:               namespace,
+		NetStats:        make(map[string]*NetStat),
+		Running:         false,
+		runningCaptures: make([]chan bool, 0),
+	}
+}
+
+func (d *NetstatdInNS) Run() error {
+	if d.Running {
 		return nil
 	}
 
@@ -127,19 +143,27 @@ func (d NetstatdInNS) Run() error {
 	}
 
 	for _, iface := range ifs {
-		err = d.capture(iface)
+		stop, err := d.Capture(iface)
 		if err != nil {
 			log.Printf("error capturing on interface, %v", err)
 			return err
 		}
+		d.runningCaptures = append(d.runningCaptures, stop)
 	}
 
-	d.running = true
+	d.Running = true
 	return nil
 }
 
-func (d NetstatdInNS) Stop() {
+func (d *NetstatdInNS) Stop() {
+	if !d.Running {
+		return
+	}
 
+	for _, runningCapture := range d.runningCaptures {
+		runningCapture <- true
+	}
+	d.Running = false
 }
 
 func (d NetstatdInNS) FindDevs(exceptions ...string) ([]pcap.Interface, error) {
@@ -164,7 +188,7 @@ func (d NetstatdInNS) FindDevs(exceptions ...string) ([]pcap.Interface, error) {
 	return ifs, nil
 }
 
-func (d NetstatdInNS) capture(iface pcap.Interface) error {
+func (d *NetstatdInNS) Capture(iface pcap.Interface) (chan bool, error) {
 	log.Printf("starting capture on interface %s", iface.Name)
 
 	snaplen := 65536
@@ -173,18 +197,18 @@ func (d NetstatdInNS) capture(iface pcap.Interface) error {
 	handle, err := pcap.OpenLive(iface.Name, int32(snaplen), true, pcap.BlockForever)
 	if err != nil {
 		log.Printf("error opening pcap handle, %v", err)
-		return err
+		return nil, err
 	}
 
 	err = handle.SetDirection(pcap.DirectionIn)
 	if err != nil {
 		log.Printf("error setting direction, %v", err)
-		return err
+		return nil, err
 	}
 
 	if err := handle.SetBPFFilter(filter); err != nil {
 		log.Printf("error setting BPF filter, %v", err)
-		return err
+		return nil, err
 	}
 
 	// Set up assembly
@@ -198,6 +222,9 @@ func (d NetstatdInNS) capture(iface pcap.Interface) error {
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	packets := packetSource.Packets()
+
+	stop := make(chan bool)
+
 	go func() {
 		for {
 			select {
@@ -212,9 +239,12 @@ func (d NetstatdInNS) capture(iface pcap.Interface) error {
 				}
 				tcp := packet.TransportLayer().(*layers.TCP)
 				assembler.AssembleWithTimestamp(packet.NetworkLayer().NetworkFlow(), tcp, packet.Metadata().Timestamp)
+			case <-stop:
+				log.Printf("stop capturing on interface %s", iface.Name)
+				return
 			}
 		}
 	}()
 
-	return nil
+	return stop, nil
 }
